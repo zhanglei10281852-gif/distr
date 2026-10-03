@@ -65,6 +65,20 @@ func VerifyToken(token string) (jwt.Token, error) {
 	return jwt.ParseString(token, jwt.WithKey(jwa.HS256(), key))
 }
 
+// ResetTokenID returns the persistent identity a password reset token carries, or false when the token has
+// no valid jti claim.
+func ResetTokenID(token jwt.Token) (uuid.UUID, bool) {
+	id, err := jwt.Get[string](token, jwt.JwtIDKey)
+	if err != nil {
+		return uuid.Nil, false
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return uuid.Nil, false
+	}
+	return parsed, true
+}
+
 func encode(claims map[string]any) (jwt.Token, string, error) {
 	key, err := signingKey()
 	if err != nil {
@@ -104,11 +118,26 @@ func GenerateCustomOIDCToken(
 	})
 }
 
-func GenerateResetToken(user types.UserAccount) (jwt.Token, string, error) {
-	return generateUserToken(user, nil, env.ResetTokenValidDuration(), map[string]any{
+// ResetToken is a password reset token together with the persistent identity it is validated against.
+type ResetToken struct {
+	Token     jwt.Token
+	Signed    string
+	ID        uuid.UUID
+	ExpiresAt time.Time
+}
+
+func GenerateResetToken(user types.UserAccount) (ResetToken, error) {
+	id := uuid.New()
+	token, signed, err := generateUserToken(user, nil, env.ResetTokenValidDuration(), map[string]any{
 		TokenScopeKey:        TokenScopePasswordReset,
 		UserEmailVerifiedKey: true,
+		jwt.JwtIDKey:         id.String(),
 	})
+	if err != nil {
+		return ResetToken{}, err
+	}
+	expiresAt, _ := token.Expiration()
+	return ResetToken{Token: token, Signed: signed, ID: id, ExpiresAt: expiresAt}, nil
 }
 
 func GenerateVerificationTokenValidFor(user types.UserAccount) (jwt.Token, string, error) {

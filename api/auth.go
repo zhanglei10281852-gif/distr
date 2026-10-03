@@ -68,3 +68,14 @@ type AuthAcceptInviteRequest struct {
 func (r *AuthAcceptInviteRequest) Validate() error {
 	return validation.ValidatePassword(r.Password)
 }
+
+const (
+	PasswordResetLinkInvalidCode    = "password_reset_link_invalid"
+	PasswordResetLinkUsedCode       = "password_reset_link_used"
+	PasswordResetLinkSupersededCode = "password_reset_link_superseded"
+	PasswordResetLinkExpiredCode    = "password_reset_link_expired"
+)
+
+type AuthResetLinkErrorResponse struct {
+	Error string `json:"error"`
+}

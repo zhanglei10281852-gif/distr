@@ -47,6 +47,12 @@ export class ForgotComponent implements OnInit, OnDestroy {
         if (reason === 'invite-expired') {
           this.errorMessage =
             'Your invite link has expired. To finalize your account setup, ' + 'please request a password reset here. ';
+        } else if (reason === 'reset-used') {
+          this.errorMessage = 'This password reset link has already been used. Please request a new link here.';
+        } else if (reason === 'reset-superseded') {
+          this.errorMessage =
+            'This password reset link is no longer valid because a newer link was sent. ' +
+            'Please request a new link here.';
         } else if (reason === 'reset-expired') {
           this.errorMessage = 'Your password reset link has expired. Please request a new link here.';
         }

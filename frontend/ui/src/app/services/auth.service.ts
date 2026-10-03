@@ -259,8 +259,19 @@ export const tokenInterceptor: HttpInterceptorFn = (req, next) => {
         return next(req.clone({headers: req.headers.set('Authorization', `Bearer ${token}`)})).pipe(
           tap({
             error: (e) => {
-              if (e instanceof HttpErrorResponse && e.status == 401 && !isUnrelatedToActionFlow(auth, req)) {
-                auth.logout();
+              if (!(e instanceof HttpErrorResponse) || e.status !== 401) {
+                return;
+              }
+              const resetReason = resetLinkErrorReason(e, req);
+              if (resetReason !== undefined) {
+                clearActionTokenOnly(auth);
+                redirectToForgot(resetReason, claims?.email);
+                return;
+              }
+              if (!isUnrelatedToActionFlow(auth, req)) {
+                // During an action flow the rejected credential is the action token. A regular session
+                // token stored alongside it is unrelated and must survive the failed link.
+                clearActionTokenOnly(auth);
                 removeJwtQueryParamAndRefresh(claims?.email);
               }
             },
@@ -278,6 +289,47 @@ export const tokenInterceptor: HttpInterceptorFn = (req, next) => {
     return next(req);
   }
 };
+
+function clearActionTokenOnly(auth: AuthService) {
+  if (auth.actionToken === null) {
+    auth.logout();
+  } else {
+    auth.actionToken = null;
+  }
+}
+
+const resetConfirmUrl = `${authBaseUrl}/reset/confirm`;
+
+// Maps the stable server codes of an invalidated reset link to the recovery reason of the /forgot page.
+function resetLinkErrorReason(e: HttpErrorResponse, req: HttpRequest<unknown>): string | undefined {
+  if (req.url !== resetConfirmUrl || typeof e.error !== 'object' || e.error === null) {
+    return undefined;
+  }
+  switch ((e.error as {error?: unknown}).error) {
+    case 'password_reset_link_used':
+      return 'reset-used';
+    case 'password_reset_link_superseded':
+      return 'reset-superseded';
+    case 'password_reset_link_expired':
+    case 'password_reset_link_invalid':
+      return 'reset-expired';
+    default:
+      return undefined;
+  }
+}
+
+function redirectToForgot(reason: string, email?: string) {
+  const url = new URL(location.href);
+  if (url.searchParams.has('jwt')) {
+    url.searchParams.delete('jwt');
+  }
+  url.pathname = '/forgot';
+  url.searchParams.set('reason', reason);
+  if (email) {
+    url.searchParams.set('email', email);
+  }
+  location.assign(url);
+}
 
 // Pages on which the user is setting up their credentials with a special token instead of a session.
 export const actionFlowPaths = ['/reset', '/join', '/verify'];

@@ -1,0 +1,3 @@
+DROP TABLE UserAccount_PasswordResetToken;
+
+DROP TYPE PASSWORD_RESET_TOKEN_STATUS;

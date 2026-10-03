@@ -30,6 +30,7 @@ import (
 	"github.com/go-chi/httprate"
 	"github.com/go-mailx/mailx"
 	"github.com/google/uuid"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/oaswrap/spec/adapter/chiopenapi"
 	"github.com/oaswrap/spec/option"
 	"go.uber.org/zap"
@@ -148,7 +149,7 @@ func authAcceptInviteHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	setPasswordAndLogin(w, r, userauth.SetInitialUserPassword, body.Password, body.Name, body.MFACode)
+	setPasswordAndLogin(w, r, userauth.SetInitialUserPassword, body.Password, body.Name, body.MFACode, nil, nil)
 }
 
 func authResetConfirmHandler(w http.ResponseWriter, r *http.Request) {
@@ -160,20 +161,53 @@ func authResetConfirmHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	setPasswordAndLogin(w, r, userauth.SetUserPassword, body.Password, nil, body.MFACode)
+	ctx := r.Context()
+	authn := auth.Authentication.Require(ctx)
+	user := authn.CurrentUser()
+	jwtToken, ok := authn.Token().(jwt.Token)
+	if !ok {
+		respondResetLinkInvalid(w)
+		return
+	}
+	jti, ok := authjwt.ResetTokenID(jwtToken)
+	if !ok {
+		respondResetLinkInvalid(w)
+		return
+	}
+	validateIdentity := func(ctx context.Context) error {
+		return userauth.ValidatePasswordResetLink(ctx, *user, jti)
+	}
+	consumeIdentity := func(ctx context.Context) error {
+		return userauth.ConsumePasswordResetLink(ctx, *user, jti)
+	}
+	setPasswordAndLogin(w, r, userauth.SetUserPassword, body.Password, nil, body.MFACode,
+		validateIdentity, consumeIdentity)
+}
+
+func respondResetLinkInvalid(w http.ResponseWriter) {
+	RespondJSONWithStatus(w, http.StatusUnauthorized,
+		api.AuthResetLinkErrorResponse{Error: api.PasswordResetLinkInvalidCode})
+}
+
+func respondResetLinkError(w http.ResponseWriter, code string) {
+	RespondJSONWithStatus(w, http.StatusUnauthorized, api.AuthResetLinkErrorResponse{Error: code})
 }
 
 // setPasswordAndLogin sets (and persists) the given password and optional name for the authenticated user,
 // verifies their email when the credential carries a verified email claim, and responds with a fresh login
 // token so the frontend can log the user in directly. It is shared by the invite-accept and reset-confirm flows.
 // An account with MFA enabled has to pass the same check as on a regular login before any of this happens,
-// since a reset or invitation link only proves control over the mailbox.
+// since a reset or invitation link only proves control over the mailbox. For password resets, validateIdentity
+// and consumeIdentity pin the request to the token's persistent one-time identity: it is validated before the
+// credentials change and consumed after every other step succeeded, so any failure rolls the transaction
+// back without spending the link or a recovery code.
 func setPasswordAndLogin(
 	w http.ResponseWriter,
 	r *http.Request,
 	setPassword func(ctx context.Context, user *types.UserAccount, password string, name *string) error,
 	password string,
 	name, mfaCode *string,
+	validateIdentity, consumeIdentity func(context.Context) error,
 ) {
 	ctx := r.Context()
 	log := internalctx.GetLogger(ctx)
@@ -186,6 +220,11 @@ func setPasswordAndLogin(
 
 	var token string
 	err := db.RunTx(ctx, func(ctx context.Context) error {
+		if validateIdentity != nil {
+			if err := validateIdentity(ctx); err != nil {
+				return err
+			}
+		}
 		if err := userauth.VerifyMFA(ctx, *user, mfaCode); err != nil {
 			return err
 		}
@@ -202,9 +241,29 @@ func setPasswordAndLogin(
 		}
 		var err error
 		token, err = userauth.GenerateLoginToken(ctx, *user)
-		return err
+		if err != nil {
+			return err
+		}
+		if consumeIdentity != nil {
+			return consumeIdentity(ctx)
+		}
+		return nil
 	})
 	if err != nil {
+		switch {
+		case errors.Is(err, userauth.ErrResetLinkUsed):
+			respondResetLinkError(w, api.PasswordResetLinkUsedCode)
+			return
+		case errors.Is(err, userauth.ErrResetLinkSuperseded):
+			respondResetLinkError(w, api.PasswordResetLinkSupersededCode)
+			return
+		case errors.Is(err, userauth.ErrResetLinkExpired):
+			respondResetLinkError(w, api.PasswordResetLinkExpiredCode)
+			return
+		case errors.Is(err, userauth.ErrResetLinkInvalid):
+			respondResetLinkError(w, api.PasswordResetLinkInvalidCode)
+			return
+		}
 		if errors.Is(err, userauth.ErrMFARequired) {
 			RespondJSON(w, api.AuthLoginResponse{RequiresMFA: true})
 		} else if errors.Is(err, userauth.ErrMFACodeInvalid) {
@@ -526,7 +585,7 @@ func authResetPasswordHandler(w http.ResponseWriter, r *http.Request) {
 		log.Error("could not send reset mail", zap.Error(err))
 		sentry.GetHubFromContext(ctx).CaptureException(err)
 		http.Error(w, "something went wrong", http.StatusInternalServerError)
-	} else if _, token, err := authjwt.GenerateResetToken(*user); err != nil {
+	} else if resetToken, err := authjwt.GenerateResetToken(*user); err != nil {
 		log.Error("could not send reset mail", zap.Error(err))
 		sentry.GetHubFromContext(ctx).CaptureException(err)
 		http.Error(w, "something went wrong", http.StatusInternalServerError)
@@ -567,9 +626,20 @@ func authResetPasswordHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		mailOpts = append(mailOpts,
-			mailx.HtmlBodyTemplate(mailtemplates.PasswordReset(ctx, *user, organization, customerOrgID, token)))
+			mailx.HtmlBodyTemplate(mailtemplates.PasswordReset(ctx, *user, organization, customerOrgID, resetToken.Signed)))
 		if err := mailer.Send(ctx, mailOpts...); err != nil {
+			// The identity is recorded only after a successful send, so a failed delivery leaves the
+			// account's still-valid older links usable.
 			log.Warn("could not send reset mail", zap.Error(err))
+			sentry.GetHubFromContext(ctx).CaptureException(err)
+			http.Error(w, "something went wrong", http.StatusInternalServerError)
+		} else if err := db.ActivatePasswordResetToken(ctx, types.PasswordResetToken{
+			ID:            resetToken.ID,
+			UserAccountID: user.ID,
+			ExpiresAt:     resetToken.ExpiresAt,
+			Status:        types.PasswordResetTokenStatusActive,
+		}); err != nil {
+			log.Error("could not activate password reset token", zap.Error(err))
 			sentry.GetHubFromContext(ctx).CaptureException(err)
 			http.Error(w, "something went wrong", http.StatusInternalServerError)
 		} else {

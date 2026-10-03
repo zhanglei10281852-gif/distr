@@ -57,8 +57,8 @@ export class PasswordResetComponent {
     }
   }
 
-  public async logoutAndRedirectToLogin() {
-    await firstValueFrom(this.auth.logout());
+  public logoutAndRedirectToLogin() {
+    this.auth.actionToken = null;
     location.assign('/login');
   }
 }
